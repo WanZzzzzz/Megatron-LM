@@ -823,7 +823,7 @@ def group_params_for_buffers(
         assert param.requires_grad
 
         param_dtype = param.dtype
-        if is_float8tensor(param) or is_nvfp4tensor(param):
+        if _param_uses_quantized_storage(param):
             param_dtype = torch.uint8
         grad_dtype = torch.float if grad_reduce_in_fp32 else param.dtype
         is_expert_parallel = not getattr(param, 'allreduce', True)
