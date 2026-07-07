@@ -510,6 +510,80 @@ def post_all_gather_processing(model_params):
         pass
 
 
+def grouped_quantize_mxfp8_params(model_params, source_buffer, grouped_output=None):
+    """Quantize a contiguous 1-D BF16/FP16 buffer into cached MXFP8 grouped output."""
+    if len(model_params) == 0:
+        return grouped_output
+
+    try:
+        import transformer_engine_torch as tex
+    except (ImportError, ModuleNotFoundError):
+        return None
+
+    if not hasattr(tex, "group_quantize"):
+        return None
+
+    first_quantizer = model_params[0]._get_quantizer()
+    quantizer = first_quantizer.copy()
+    shapes = []
+    offsets = [0]
+    expected_numel = 0
+
+    for model_param in model_params:
+        if not is_mxfp8tensor(model_param) or len(model_param.data.shape) != 2:
+            return None
+
+        model_quantizer = model_param._get_quantizer()
+        if (
+            type(model_quantizer) is not type(first_quantizer)
+            or model_quantizer.dtype != first_quantizer.dtype
+            or model_quantizer.rowwise_usage != first_quantizer.rowwise_usage
+            or model_quantizer.columnwise_usage != first_quantizer.columnwise_usage
+            or model_quantizer.optimize_for_gemm != first_quantizer.optimize_for_gemm
+        ):
+            return None
+
+        shape = tuple(model_param.data.shape)
+        shapes.append(shape)
+        expected_numel += model_param.data.numel()
+        offsets.append(expected_numel)
+
+    if source_buffer.ndim != 1 or source_buffer.numel() != expected_numel:
+        return None
+
+    input_tensor = source_buffer.view(1, -1)
+
+    with torch.no_grad():
+        if grouped_output is not None and hasattr(tex, "group_quantize_into"):
+            tex.group_quantize_into(input_tensor, grouped_output)
+            return grouped_output
+
+        first_dims = torch.tensor(
+            [shape[0] for shape in shapes], dtype=torch.int64, device=source_buffer.device
+        )
+        last_dims = torch.tensor(
+            [shape[1] for shape in shapes], dtype=torch.int64, device=source_buffer.device
+        )
+
+        grouped_output = tex.group_quantize(
+            input_tensor,
+            quantizer,
+            len(model_params),
+            first_dims,
+            last_dims,
+        )
+        quantized_tensors = getattr(grouped_output, "quantized_tensors", None)
+        if quantized_tensors is None:
+            grouped_output.tensor_shapes = shapes
+            grouped_output.offsets = offsets
+            quantized_tensors = grouped_output.split_into_quantized_tensors()
+
+        for model_param, quantized_tensor in zip(model_params, quantized_tensors):
+            model_param.data = quantized_tensor
+
+    return grouped_output
+
+
 def is_first_last_bf16_layer(config: TransformerConfig, layer_no: int):
     """Check if the layer is in bf16."""
     num_bf16_layers_at_start = (

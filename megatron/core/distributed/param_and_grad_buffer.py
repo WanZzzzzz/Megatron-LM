@@ -22,6 +22,7 @@ from megatron.core.utils import log_single_rank
 
 from ..fp4_utils import get_nvfp4_rowwise_packed_shape, is_nvfp4tensor
 from ..fp8_utils import (
+    grouped_quantize_mxfp8_params,
     is_float8tensor,
     is_mxfp8tensor,
     modify_underlying_storage,
@@ -279,19 +280,91 @@ class _ParamAndGradBucketGroup:
     def _post_param_sync(self):
         """Run post-processing after param all-gather completes."""
         if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
-            for bucket in self.buckets:
-                is_bf16_weight_bucket = False
-                for param in bucket.params:
-                    # Skip copying since bf16 weights in the mxfp8 model
-                    # are already mapped to param.data.
-                    if not is_float8tensor(param):
-                        is_bf16_weight_bucket = True
-                        break
-                    param_start, param_end = bucket.param_to_index[param]
-                    param_slice = bucket.param_data.view(-1)[param_start:param_end]
+            def _can_group_quantize_mxfp8_param(param):
+                if not is_mxfp8tensor(param) or len(param.data.shape) != 2:
+                    return False
+                # TE's grouped MXFP8 varying-both-dims kernel requires 128-aligned dims.
+                return param.data.shape[0] % 128 == 0 and param.data.shape[1] % 128 == 0
+
+            def _mxfp8_group_key(param):
+                quantizer = param._get_quantizer()
+                return (
+                    type(quantizer),
+                    quantizer.dtype,
+                    quantizer.rowwise_usage,
+                    quantizer.columnwise_usage,
+                    quantizer.optimize_for_gemm,
+                )
+
+            def _copy_params_from_buffer(param_infos, bucket_param_data):
+                for param, param_start, param_end in param_infos:
+                    param_slice = bucket_param_data[param_start:param_end]
                     param.data.copy_(param_slice.view(param.data.shape))
-                if is_bf16_weight_bucket:
+
+            def _flush_mxfp8_group(group_infos, bucket_param_data, grouped_output_cache):
+                if len(group_infos) == 0:
+                    return
+
+                group_start = group_infos[0][1]
+                group_end = group_infos[-1][2]
+                group_params = [param for param, _, _ in group_infos]
+                cache_key = (group_start, group_end, tuple(id(param) for param in group_params))
+                group_buffer = bucket_param_data[group_start:group_end]
+                grouped_output = grouped_quantize_mxfp8_params(
+                    group_params,
+                    group_buffer,
+                    grouped_output_cache.get(cache_key),
+                )
+                if grouped_output is None:
+                    _copy_params_from_buffer(group_infos, bucket_param_data)
+                else:
+                    grouped_output_cache[cache_key] = grouped_output
+
+            for bucket in self.buckets:
+                # Skip mixed/BF16 buckets since BF16 weights are already mapped to param.data.
+                if any(not is_float8tensor(param) for param in bucket.params):
                     continue
+
+                bucket_param_data = bucket.param_data.view(-1)
+                grouped_output_cache = getattr(bucket, "mxfp8_grouped_quant_outputs", None)
+                if grouped_output_cache is None:
+                    grouped_output_cache = {}
+                    bucket.mxfp8_grouped_quant_outputs = grouped_output_cache
+                mxfp8_group_infos = []
+                mxfp8_group_key = None
+                mxfp8_group_end = None
+
+                for param in sorted(bucket.params, key=lambda p: bucket.param_to_index[p][0]):
+                    param_start, param_end = bucket.param_to_index[param]
+                    if _can_group_quantize_mxfp8_param(param):
+                        param_group_key = _mxfp8_group_key(param)
+                        if (
+                            len(mxfp8_group_infos) > 0
+                            and (
+                                param_start != mxfp8_group_end
+                                or param_group_key != mxfp8_group_key
+                            )
+                        ):
+                            _flush_mxfp8_group(
+                                mxfp8_group_infos, bucket_param_data, grouped_output_cache
+                            )
+                            mxfp8_group_infos = []
+
+                        mxfp8_group_infos.append((param, param_start, param_end))
+                        mxfp8_group_key = param_group_key
+                        mxfp8_group_end = param_end
+                    else:
+                        _flush_mxfp8_group(
+                            mxfp8_group_infos, bucket_param_data, grouped_output_cache
+                        )
+                        mxfp8_group_infos = []
+                        mxfp8_group_key = None
+                        mxfp8_group_end = None
+                        _copy_params_from_buffer(
+                            [(param, param_start, param_end)], bucket_param_data
+                        )
+
+                _flush_mxfp8_group(mxfp8_group_infos, bucket_param_data, grouped_output_cache)
                 # All-gathered params are not needed after being copied to param.data.
                 # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
                 # We cannot zero out the entire grad buffer because one grad buffer may
