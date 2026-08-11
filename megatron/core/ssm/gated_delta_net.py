@@ -222,10 +222,16 @@ class GatedDeltaNet(MegatronModule):
             hidden_size=self.value_head_dim,
             eps=self.config.layernorm_epsilon,
         )
+        self.recompute_gdn = False
         self.recompute_norm_out = False
         self.norm_out_checkpoint = None
         if self.config.recompute_granularity == "selective":
-            self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
+            self.recompute_gdn = "gdn" in self.config.recompute_modules
+            # Whole-GDN checkpointing subsumes the output-only checkpoint and
+            # avoids nesting CheckpointWithoutOutput inside a normal checkpoint.
+            self.recompute_norm_out = (
+                "gdn_norm_out" in self.config.recompute_modules and not self.recompute_gdn
+            )
 
         self.out_proj = build_module(
             submodules.out_proj,
@@ -267,6 +273,43 @@ class GatedDeltaNet(MegatronModule):
                 self.A_log.data.copy_(torch.log(A))
 
     def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        inference_context: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[int] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        **kwargs,
+    ):
+        """Run GDN, checkpointing the complete module when requested during training."""
+        if self.recompute_gdn and self.training:
+
+            def custom_forward(checkpointed_hidden_states):
+                return self._forward(
+                    checkpointed_hidden_states,
+                    attention_mask,
+                    inference_context=inference_context,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                    inference_params=inference_params,
+                    **kwargs,
+                )
+
+            return tensor_parallel.checkpoint(custom_forward, False, hidden_states)
+
+        return self._forward(
+            hidden_states,
+            attention_mask,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            inference_params=inference_params,
+            **kwargs,
+        )
+
+    def _forward(
         self,
         hidden_states: Tensor,
         attention_mask: Tensor,

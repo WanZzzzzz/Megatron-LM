@@ -166,7 +166,17 @@ class TestGatedDeltaNet:
             output.dtype == hidden_states.dtype
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
 
-    def test_selective_recompute_norm_out(self):
+    @pytest.mark.parametrize(
+        ("recompute_modules", "expected_recompute_gdn", "expected_recompute_norm_out"),
+        [
+            (["gdn_norm_out"], False, True),
+            (["gdn"], True, False),
+            (["gdn", "gdn_norm_out"], True, False),
+        ],
+    )
+    def test_selective_recompute(
+        self, recompute_modules, expected_recompute_gdn, expected_recompute_norm_out
+    ):
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
         pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
@@ -204,7 +214,7 @@ class TestGatedDeltaNet:
         base_config = copy.deepcopy(self.transformer_config)
         rec_config = copy.deepcopy(self.transformer_config)
         rec_config.recompute_granularity = "selective"
-        rec_config.recompute_modules = ["gdn_norm_out"]
+        rec_config.recompute_modules = recompute_modules
 
         model_parallel_cuda_manual_seed(42)
         torch.manual_seed(42)
@@ -223,6 +233,7 @@ class TestGatedDeltaNet:
         model_parallel_cuda_manual_seed(42)
         torch.manual_seed(42)
         base_gdn = build_gdn(base_config)
+        assert base_gdn.recompute_gdn is False
         assert base_gdn.recompute_norm_out is False
         base_output, base_grads, base_input_grad = run(base_gdn, hidden_states)
         hidden_states.grad = None
@@ -234,9 +245,10 @@ class TestGatedDeltaNet:
         model_parallel_cuda_manual_seed(42)
         torch.manual_seed(42)
         rec_gdn = build_gdn(rec_config)
-        assert rec_gdn.recompute_norm_out is True
+        assert rec_gdn.recompute_gdn is expected_recompute_gdn
+        assert rec_gdn.recompute_norm_out is expected_recompute_norm_out
         rec_output, rec_grads, rec_input_grad = run(rec_gdn, hidden_states)
-        assert rec_gdn.norm_out_checkpoint is not None
+        assert (rec_gdn.norm_out_checkpoint is not None) is expected_recompute_norm_out
 
         rank = torch.distributed.get_rank()
         assert torch.equal(rec_output, base_output), f"Output not identical ({rank=})"
