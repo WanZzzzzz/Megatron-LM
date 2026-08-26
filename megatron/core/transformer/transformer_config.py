@@ -1133,13 +1133,14 @@ class TransformerConfig(ModelParallelConfig):
     offload_modules: Optional[list[str]] = field(default_factory=list)
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
-             "mlp_norm", "expert_fc1", "moe_act".
+             "mlp_norm", "expert_fc1", "expert_fc2", "moe_act".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
     "attn_proj": offload the input of the attn linear projection part.
     "mlp_norm": offload the input of the normalization in the mlp part.
     "expert_fc1": offload the input of the expert fc1 part.
+    "expert_fc2": offload the input of the expert fc2 part.
     "moe_act": offload the input of the moe act part.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
@@ -1683,6 +1684,7 @@ class TransformerConfig(ModelParallelConfig):
                 "core_attn",
                 "attn_proj",
                 "expert_fc1",
+                "expert_fc2",
                 "moe_act",
                 "attn_norm",
                 "mlp_norm",
@@ -1707,11 +1709,14 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_paged_stash requires moe_expert_rank_capacity_factor to be set; "
                     "there is no need to use paged stashing without it."
                 )
-            moe_offload_conflict = {"expert_fc1", "moe_act"} & set(self.offload_modules)
+            moe_offload_conflict = {"expert_fc1", "expert_fc2", "moe_act"} & set(
+                self.offload_modules
+            )
             if moe_offload_conflict:
                 raise ValueError(
                     "When moe_paged_stash is enabled, offload_modules must not include "
-                    f"expert_fc1 or moe_act (paged stash covers those activations). "
+                    "expert_fc1, expert_fc2, or moe_act "
+                    f"(paged stash covers those activations). "
                     f"Remove: {moe_offload_conflict}"
                 )
 

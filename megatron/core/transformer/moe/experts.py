@@ -245,6 +245,11 @@ class TEGroupedMLP(MegatronModule):
             and "expert_fc1" in self.config.offload_modules
         )
 
+        self.offload_expert_fc2 = (
+            self.config.fine_grained_activation_offloading
+            and "expert_fc2" in self.config.offload_modules
+        )
+
         self.offload_moe_act = (
             self.config.fine_grained_activation_offloading
             and "moe_act" in self.config.offload_modules
@@ -254,7 +259,11 @@ class TEGroupedMLP(MegatronModule):
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
         )
-        if self.activation_recompute and (self.config.fp8 or self.config.fp4):
+        # Save one original FC2 input instead of retaining per-expert grouped/quantized
+        # representations when that input will be recomputed or offloaded.
+        if self.offload_expert_fc2 or (
+            self.activation_recompute and (self.config.fp8 or self.config.fp4)
+        ):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.linear_fc2)
@@ -329,7 +338,7 @@ class TEGroupedMLP(MegatronModule):
         # Check for unsupported features
         if self.tp_group.size() > 1:
             return False  # Tensor parallelism is not supported
-        if self.offload_expert_fc1 or self.offload_moe_act:
+        if self.offload_expert_fc1 or self.offload_expert_fc2 or self.offload_moe_act:
             return False  # Fine-grained activation offloading is not supported
         if self.config.moe_apply_probs_on_input:
             return False  # Pre-multiplying probs is not supported
@@ -775,9 +784,21 @@ class TEGroupedMLP(MegatronModule):
         else:
             with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
-        output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
+        with off_interface(
+            self.offload_expert_fc2, bias_act_output, "expert_fc2"
+        ) as bias_act_output:
+            output, output_bias = apply_module(self.linear_fc2)(
+                bias_act_output, tokens_per_expert
+            )
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
+
+        if self.offload_expert_fc2:
+            output = off_interface.group_commit(
+                output,
+                name="expert_fc2",
+                forced_released_tensors=[bias_act_output],
+            )
 
         # Delay the offload of the moe act until after the linear_fc2 has been computed
         # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.

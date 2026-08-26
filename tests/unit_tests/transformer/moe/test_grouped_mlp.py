@@ -565,6 +565,7 @@ def _make_fused_impl_support_module(
     module.activation_func = object()
     module.tp_group = SimpleNamespace(size=lambda: 1)
     module.offload_expert_fc1 = False
+    module.offload_expert_fc2 = False
     module.offload_moe_act = False
     common = dict(
         device="cuda",

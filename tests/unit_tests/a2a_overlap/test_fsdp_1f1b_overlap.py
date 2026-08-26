@@ -70,7 +70,18 @@ class TestFSDP1F1BOverlap:
     )
     @pytest.mark.parametrize(
         "offload_modules",
-        [[], ["attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act"]],
+        [
+            [],
+            [
+                "attn_norm",
+                "core_attn",
+                "attn_proj",
+                "mlp_norm",
+                "expert_fc1",
+                "expert_fc2",
+                "moe_act",
+            ],
+        ],
     )
     def test_fsdp_1f1b_memory_opt(self, recompute_modules, offload_modules):
         self._run_test_helper(
