@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol
@@ -62,6 +63,19 @@ if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
 else:
     TELinear, te_checkpoint = None, None
+
+
+def _moe_memory_debug_enabled() -> bool:
+    """Whether synchronized MoE stage memory diagnostics are enabled on this rank."""
+    if os.getenv("MCORE_MOE_MEMORY_DEBUG", "0") != "1":
+        return False
+    if not torch.cuda.is_available() or not torch.distributed.is_initialized():
+        return False
+    ranks = os.getenv("MCORE_MOE_MEMORY_DEBUG_RANKS", "0").strip().lower()
+    if ranks == "all":
+        return True
+    selected_ranks = {int(rank.strip()) for rank in ranks.split(",") if rank.strip()}
+    return torch.distributed.get_rank() in selected_ranks
 
 
 class ExpertsInterface(Protocol):
@@ -525,6 +539,25 @@ class MoELayer(BaseMoELayer):
 
         return shared_expert_output
 
+    def _memory_debug_snapshot(self, stage: str) -> None:
+        """Synchronize and report allocator state at a MoE forward stage."""
+        if not getattr(self, "_memory_debug_active", False):
+            return
+        torch.cuda.synchronize()
+        device = torch.cuda.current_device()
+        free, total = torch.cuda.mem_get_info(device)
+        gib = 1024**3
+        print(
+            f"[moe-mem-debug] rank={torch.distributed.get_rank()} "
+            f"layer={self.layer_number} stage={stage} "
+            f"grad_enabled={torch.is_grad_enabled()} "
+            f"allocated={torch.cuda.memory_allocated(device) / gib:.2f}GiB "
+            f"peak_allocated={torch.cuda.max_memory_allocated(device) / gib:.2f}GiB "
+            f"reserved={torch.cuda.memory_reserved(device) / gib:.2f}GiB "
+            f"device_free={free / gib:.2f}GiB of {total / gib:.2f}GiB",
+            flush=True,
+        )
+
     @internal_api
     def routed_experts_compute(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Computes the output of the routed experts on the dispatched tokens.
@@ -540,6 +573,7 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
+        self._memory_debug_snapshot("after_dispatch_postprocess")
         if hasattr(self, "_inference_token_dispatcher") and InferenceMode.is_active():
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
@@ -549,8 +583,10 @@ class MoELayer(BaseMoELayer):
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs
             )
+        self._memory_debug_snapshot("after_expert_compute")
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
+        self._memory_debug_snapshot("after_combine_preprocess")
 
         return output, mlp_bias
 
@@ -622,6 +658,10 @@ class MoELayer(BaseMoELayer):
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
             )
+        self._memory_debug_active = _moe_memory_debug_enabled() and not getattr(
+            self, "_memory_debug_completed", False
+        )
+        self._memory_debug_snapshot("entry")
         # Select the active token dispatcher based on whether the inference engine
         # is currently using the model. Only applies when the inference dispatcher
         # was set up (config.transformer_impl == "inference_optimized").
@@ -644,7 +684,9 @@ class MoELayer(BaseMoELayer):
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
                     probs, routing_map = self.route(hidden_states, padding_mask)
+                    self._memory_debug_snapshot("after_router")
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+                    self._memory_debug_snapshot("after_preprocess")
 
                     if intermediate_tensors is not None:
                         return hidden_states, probs, shared_expert_output
@@ -662,11 +704,13 @@ class MoELayer(BaseMoELayer):
                     hidden_states, probs = intermediate_tensors
 
                 dispatched_input, probs = self.dispatch(hidden_states, probs)
+                self._memory_debug_snapshot("after_dispatch")
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
                 output = self.combine(output)
+                self._memory_debug_snapshot("after_combine")
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias
@@ -676,6 +720,7 @@ class MoELayer(BaseMoELayer):
                     output, shared_expert_output = intermediate_tensors
 
                 output = self.postprocess(output, shared_expert_output)
+                self._memory_debug_snapshot("after_postprocess")
 
                 if intermediate_tensors is not None:
                     return output
@@ -700,6 +745,10 @@ class MoELayer(BaseMoELayer):
         else:
             outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
 
+        if self._memory_debug_active:
+            self._memory_debug_snapshot("exit")
+            self._memory_debug_completed = True
+            self._memory_debug_active = False
         return outputs
 
     def backward_dw(self, routed_experts: bool = True, shared_experts: bool = False):

@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
@@ -22,6 +23,46 @@ def debug_rank(message):
     assert torch.distributed.is_initialized()
     if torch.distributed.get_rank() == DEBUG_RANK:
         print(message)
+
+
+def _memory_debug_enabled() -> bool:
+    """Whether synchronized MoE/offload memory diagnostics are enabled on this rank."""
+    if os.getenv("MCORE_MOE_MEMORY_DEBUG", "0") != "1":
+        return False
+    if not torch.cuda.is_available() or not torch.distributed.is_initialized():
+        return False
+    ranks = os.getenv("MCORE_MOE_MEMORY_DEBUG_RANKS", "0").strip().lower()
+    if ranks == "all":
+        return True
+    selected_ranks = {int(rank.strip()) for rank in ranks.split(",") if rank.strip()}
+    return torch.distributed.get_rank() in selected_ranks
+
+
+def _print_offload_commit_memory(
+    group_name: str,
+    offloaded_bytes: int,
+    offloaded_tensors: int,
+    cumulative_bytes: int,
+    cumulative_tensors: int,
+) -> None:
+    """Synchronize and print memory plus per-group offload progress."""
+    if not _memory_debug_enabled():
+        return
+    torch.cuda.synchronize()
+    device = torch.cuda.current_device()
+    free, total = torch.cuda.mem_get_info(device)
+    gib = 1024**3
+    mib = 1024**2
+    print(
+        f"[offload-mem-debug] rank={torch.distributed.get_rank()} group={group_name} "
+        f"commit_mib={offloaded_bytes / mib:.2f} commit_tensors={offloaded_tensors} "
+        f"cumulative_mib={cumulative_bytes / mib:.2f} "
+        f"cumulative_tensors={cumulative_tensors} "
+        f"allocated={torch.cuda.memory_allocated(device) / gib:.2f}GiB "
+        f"reserved={torch.cuda.memory_reserved(device) / gib:.2f}GiB "
+        f"device_free={free / gib:.2f}GiB of {total / gib:.2f}GiB",
+        flush=True,
+    )
 
 
 def print_offload_summary_table(total_offload_bytes: Dict[str, int]):
@@ -432,6 +473,8 @@ class PipelineOffloadManager:
         # Sometimes we need to delay the offloading and launch it later.
         # The delayed offload groups are stored in a queue.
         self._delayed_offload_groups = []
+        self._debug_offload_bytes = defaultdict(int)
+        self._debug_offload_tensors = defaultdict(int)
         self.reset()
 
     @property
@@ -897,11 +940,15 @@ class ChunkOffloadHandler:
         """offload a group of tensors recorded in tensor_push()."""
         debug_rank("------bulk_offload_group")
         group_to_offload = self._groups_to_offload[-1]
+        offloaded_bytes = 0
+        offloaded_tensors = 0
         nvtx_msg = "activation offloading " + group_to_offload._name
         nvtx_range_push(nvtx_msg)
         with torch.cuda.stream(self.d2h_stream):
             for tensor_tag, tensor_on_device in group_to_offload._tensors.items():
                 if self.tensor_need_offloading_checker(tensor_on_device):
+                    offloaded_bytes += tensor_on_device.numel() * tensor_on_device.element_size()
+                    offloaded_tensors += 1
                     state = self.offload(
                         tensor_on_device, use_cpu_pool=group_to_offload.use_cpu_pool
                     )
@@ -920,6 +967,7 @@ class ChunkOffloadHandler:
             gname = group_to_offload._name
             self._offload_pending_by_name[gname].append(group_to_offload._offload_event)
             self._drain_offload_pending(gname)
+        return group_to_offload, offloaded_bytes, offloaded_tensors
 
     def get_max_deduplicated_groups(self):
         """Get the maximum number of deduplicated groups."""
@@ -988,7 +1036,7 @@ class ChunkOffloadHandler:
         debug_rank("----bulk_offload")
         if self.should_bulk_offload():
             self._groups_to_reload.append(self._groups_to_offload[-1])
-            self.bulk_offload_group()
+            group, offloaded_bytes, offloaded_tensors = self.bulk_offload_group()
             # Manually release tensors not auto-freed by torch GC
             if len(forced_released_tensors) > 0:
                 cur_stream = torch.cuda.current_stream()
@@ -997,6 +1045,16 @@ class ChunkOffloadHandler:
                         # Ensure tensor is not in use before freeing
                         release_tensor.record_stream(cur_stream)
                         release_tensor.untyped_storage().resize_(0)
+            manager = PipelineOffloadManager.get_instance()
+            manager._debug_offload_bytes[group._name] += offloaded_bytes
+            manager._debug_offload_tensors[group._name] += offloaded_tensors
+            _print_offload_commit_memory(
+                group._name,
+                offloaded_bytes,
+                offloaded_tensors,
+                manager._debug_offload_bytes[group._name],
+                manager._debug_offload_tensors[group._name],
+            )
 
     def _drain_offload_pending(self, group_name: str) -> None:
         """For ``group_name``, have the main stream wait on older D2H events
